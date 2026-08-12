@@ -8,6 +8,12 @@
   },
   "scripts": {
     "doctor": "node doctor.mjs",
+    "import:job-sources": "node job-source-import.mjs",
+    "import:job-sources:dry": "node job-source-import.mjs --dry-run",
+    "test:job-sources": "node --test tests/job-source-import.test.mjs",
+    "screen:candidates": "node candidate-screen.mjs",
+    "screen:candidates:dry": "node candidate-screen.mjs --dry-run",
+    "test:candidate-screen": "node --test tests/candidate-screen.test.mjs",
     "or": "node openrouter-runner.mjs",
     "or:scan": "node openrouter-runner.mjs scan",
     "or:pipeline": "node openrouter-runner.mjs pipeline",
