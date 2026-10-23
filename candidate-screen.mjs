@@ -23,6 +23,9 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INPUT = resolve(ROOT, 'data', 'candidate-pool.json');
 const DEFAULT_POLICY = resolve(ROOT, 'data', 'candidate-screen-policy.json');
 const DEFAULT_OUTPUT = resolve(ROOT, 'data', 'candidate-shortlist.json');
+// Keep the current-run audit state as the default. Historical snapshots remain
+// timestamped alongside it, while an explicit --review-state still supports
+// rerunning any prior screening round without masking new-source candidates.
 const DEFAULT_REVIEW_STATE = resolve(ROOT, 'data', 'candidate-review-state.json');
 
 function clean(value) {
@@ -164,6 +167,15 @@ function overlayReviewState(record, state) {
   };
 }
 
+function reviewStateRunAsOf(state) {
+  return clean(state?.run_as_of ?? state?.as_of ?? '');
+}
+
+function isReviewStateCurrent(state, asOf) {
+  const runAsOf = reviewStateRunAsOf(state);
+  return runAsOf === asOf;
+}
+
 function classifyLink(rawUrl) {
   const value = clean(rawUrl);
   if (!value) return { kind: 'missing', bonus: 0, note: '缺少投递入口' };
@@ -189,12 +201,22 @@ function classifyLink(rawUrl) {
 
 function broadTitle(title) {
   const text = clean(title);
-  const separators = (text.match(/[、，,；;|/]/gu) ?? []).length;
+  // Source sheets often compress a whole recruitment project into one title.
+  // Treat those rows as discovery leads only: a single official role must still
+  // be extracted before it can be scored or enter the Pipeline.  The full-width
+  // vertical bar is intentional here; it is common in Chinese campus-recruiting
+  // category lists (for example, "技术｜产品｜运营｜数据｜风险管理").
+  const separators = (text.match(/[、，,；;|/｜]/gu) ?? []).length;
   const whitespaceSegments = text.split(/\s+/u).filter(Boolean).length;
-  const roleMarkerCount = (text.match(/(?:方向|岗位|职位|类)/gu) ?? []).length;
+  const roleMarkerCount = (text.match(/(?:方向|岗位|职位|类|服务)/gu) ?? []).length;
+  const categoryPair = /(?:综合类|职能类|科技类|业务类|管理类|产品类|运营类|数据类|风控类)/u.test(text);
+  const recruitmentProject = /(?:招聘项目|(?:校园|秋季|秋招|提前批).{0,24}(?:启动|项目|计划|网申)|(?:应届|毕业生).{0,24}招聘.{0,24}(?:实习|招聘)|(?:服务线|业务线|职位类别|岗位类别))/u.test(text);
   return separators >= 2
     || (whitespaceSegments >= 4 && roleMarkerCount >= 2)
+    || (whitespaceSegments >= 3 && roleMarkerCount >= 3)
+    || (whitespaceSegments >= 2 && roleMarkerCount >= 2 && categoryPair)
     || roleMarkerCount >= 4
+    || recruitmentProject
     || /(?:等(?:岗位|职位)?$|多个岗位|职位包括|岗位包括|若干岗位|全岗位|不限岗位|下属各单位|各单位岗位|具体见.*链接|详见.*链接)/u.test(text);
 }
 
@@ -273,12 +295,17 @@ function sourceBatchClaim(policy, rawBatchText) {
     /暑期|summer/u.test(batchText) ? '暑期实习' : null,
     /校招|校园招聘/u.test(batchText) ? '校招' : null,
   ].filter(Boolean);
-  const sourceClaim = sourceClaims.length === 1 ? sourceClaims[0] : null;
+  const autumnClaims = sourceClaims.filter((claim) => claim === '提前批' || claim === '秋招');
+  const hasSummer = sourceClaims.includes('暑期实习');
+  const hasCampus = sourceClaims.includes('校招');
+  const sourceClaim = (autumnClaims.length > 0 && !hasSummer)
+    ? (autumnClaims.length > 1 ? '秋招/提前批' : autumnClaims[0])
+    : (sourceClaims.length === 1 ? sourceClaims[0] : null);
   let track = 'unknown';
-  if (sourceClaims.length > 1) track = 'ambiguous_source_claim';
-  else if (sourceClaim === '提前批' || sourceClaim === '秋招') track = 'primary_autumn';
-  else if (sourceClaim === '暑期实习') track = 'summer_internship';
-  else if (sourceClaim === '校招') track = 'campus';
+  if (autumnClaims.length > 0 && !hasSummer) track = 'primary_autumn';
+  else if (autumnClaims.length > 0 && hasSummer) track = 'ambiguous_source_claim';
+  else if (hasSummer) track = 'summer_internship';
+  else if (hasCampus) track = 'campus';
   return {
     source_claim: sourceClaim,
     source_claims: sourceClaims,
@@ -304,7 +331,7 @@ export function screenCandidate(record, policy, asOfValue) {
   const employerText = `${companyText}\n${employerTypeText}`;
   const financialEmployerMatches = testPatterns(policy.financial_employer_patterns ?? policy.financial_context_patterns, companyText);
   const hasFinancialEmployerSignal = financialEmployerMatches.length > 0;
-  const financialContextText = `${roleText}\n${companyText}\n${employerTypeText}`;
+  const financialContextText = `${roleText}\n${companyText}\n${employerTypeText}\n${joinAcrossSources(record, ['industry'])}`;
   const allText = `${financialContextText}\n${joinAcrossSources(record, ['cohort', 'batch', 'location'])}`;
   const title = clean(record.title);
   const locationText = joinAcrossSources(record, ['location']);
@@ -317,6 +344,10 @@ export function screenCandidate(record, policy, asOfValue) {
   const isBroad = valueAcrossSources(record, 'title').some((sourceTitle) => broadTitle(sourceTitle));
   const financialContextMatches = testPatterns(policy.financial_context_patterns, allText);
   const soeMatches = testPatterns(policy.soe_patterns, employerTypeText);
+  const priorityEmployerMatches = testPatterns(
+    policy.priority_employer_patterns ?? [],
+    `${companyText}\n${employerTypeText}\n${joinAcrossSources(record, ['industry'])}`,
+  );
   const location = preferredLocationAdjustment(policy, locationText);
   const sourcePriority = selectSourcePriority(record);
   const link = classifyLink(record.apply_url);
@@ -324,6 +355,10 @@ export function screenCandidate(record, policy, asOfValue) {
   const cautions = [];
   const exclusions = [];
   let rawScore = 0;
+  const batch = sourceBatchClaim(policy, joinAcrossSources(record, ['batch']));
+  const priorityEmployerExtractionCandidate = priorityEmployerMatches.length > 0
+    && financialContextMatches.length > 0
+    && batch.track === 'primary_autumn';
 
   if (targetRoleFound) {
     const [primary, ...secondary] = roleFamilies;
@@ -334,8 +369,12 @@ export function screenCandidate(record, policy, asOfValue) {
       rawScore += bonus;
       positives.push(`相邻岗位信号：${secondary.map((item) => item.label).join('、')} +${bonus}`);
     }
-  } else {
+  } else if (!priorityEmployerExtractionCandidate) {
     exclusions.push('岗位标题未命中目标岗位族，不能仅因公司名称或行业而进入核验队列');
+  } else {
+    rawScore += rules.priority_employer_bonus ?? 0;
+    positives.push(`优先金融雇主线索：${priorityEmployerMatches.slice(0, 3).join('、')} +${rules.priority_employer_bonus ?? 0}`);
+    cautions.push('优先金融雇主的综合项目：必须先从官网提取到职责明确的单一岗位，不能按项目名称评分或投递');
   }
 
   if (financialContextMatches.length > 0) {
@@ -353,19 +392,20 @@ export function screenCandidate(record, policy, asOfValue) {
     positives.push(`优先城市：${location.preferred_city}${location.matches.length > 1 ? `（同时覆盖 ${location.matches.filter((city) => city !== location.preferred_city).join('、')}）` : ''} +${location.score}`);
   }
 
-  const batch = sourceBatchClaim(policy, joinAcrossSources(record, ['batch']));
-  if (batch.source_claim === '提前批') {
+  if (batch.track === 'primary_autumn' && batch.source_claims.includes('提前批')) {
     rawScore += rules.advance_batch_bonus ?? 0;
-    positives.push(`源表标注：提前批（仅作官网核验线索） +${rules.advance_batch_bonus ?? 0}`);
-  } else if (batch.source_claim === '秋招') {
+    positives.push(`源表标注：${batch.source_claim}（仅作官网核验线索） +${rules.advance_batch_bonus ?? 0}`);
+  } else if (batch.track === 'primary_autumn' && batch.source_claims.includes('秋招')) {
     rawScore += rules.autumn_batch_bonus ?? 0;
-    positives.push(`源表标注：秋招（仅作官网核验线索） +${rules.autumn_batch_bonus ?? 0}`);
+    positives.push(`源表标注：${batch.source_claim}（仅作官网核验线索） +${rules.autumn_batch_bonus ?? 0}`);
   } else if (batch.source_claim === '校招') {
     rawScore += rules.campus_batch_bonus ?? 0;
     positives.push(`源表标注：校招（仅作官网核验线索） +${rules.campus_batch_bonus ?? 0}`);
   } else if (batch.source_claim === '暑期实习') {
     rawScore += rules.summer_batch_bonus ?? 0;
     positives.push(`源表标注：暑期实习（仅作官网核验线索） +${rules.summer_batch_bonus ?? 0}`);
+    rawScore -= rules.summer_internship_penalty ?? 0;
+    cautions.push(`普通暑期实习不占秋招主线核验队列 -${rules.summer_internship_penalty ?? 0}`);
   }
   if (batch.official_confirmation_required) {
     const sourceBatchLabel = batch.source_claim ?? batch.source_claims.join('、');
@@ -406,7 +446,11 @@ export function screenCandidate(record, policy, asOfValue) {
   }
   if (lowFitMatches.length > 0) {
     if (!targetRoleFound) {
-      exclusions.push(`低匹配岗位信号：${lowFitMatches.slice(0, 5).join('、')}`);
+      if (priorityEmployerExtractionCandidate) {
+        cautions.push(`综合项目混有低匹配职责：${lowFitMatches.slice(0, 5).join('、')}；必须仅从官网提取目标岗位后再判断`);
+      } else {
+        exclusions.push(`低匹配岗位信号：${lowFitMatches.slice(0, 5).join('、')}`);
+      }
     } else {
       rawScore -= rules.mixed_low_fit_penalty ?? 0;
       cautions.push(`目标岗位与低匹配职责混在同一条目中：${lowFitMatches.slice(0, 4).join('、')} -${rules.mixed_low_fit_penalty ?? 0}`);
@@ -425,7 +469,7 @@ export function screenCandidate(record, policy, asOfValue) {
   }
 
   const eligibleByScore = targetRoleFound && exclusions.length === 0 && rawScore >= (policy.minimum_coarse_score ?? 0);
-  const needsRoleExtraction = isBroad || genericMatches.length > 0 || lowFitMatches.length > 0;
+  const needsRoleExtraction = isBroad || genericMatches.length > 0 || lowFitMatches.length > 0 || priorityEmployerExtractionCandidate;
   const clearlyStale = update.age_days !== null && update.age_days >= 61;
   const strongExtractionCandidate = targetRoleFound
     && exclusions.length === 0
@@ -435,18 +479,23 @@ export function screenCandidate(record, policy, asOfValue) {
     && scoreBeforeCautionPenalties >= (policy.minimum_coarse_score ?? 0)
     && !clearlyStale
     && !['manual_channel', 'missing', 'invalid'].includes(link.kind);
+  const priorityEmployerReviewCandidate = priorityEmployerExtractionCandidate
+    && exclusions.length === 0
+    && !clearlyStale
+    && !['manual_channel', 'missing', 'invalid'].includes(link.kind);
   if (strongExtractionCandidate && !eligibleByScore) {
     cautions.push(`保留为岗位拆分核验：主标题命中强岗位信号 ${primaryStrongRoleMatches.slice(0, 4).join('、')}，但汇总条目本身不能直接评分或投递`);
   }
   const verificationReady = eligibleByScore
     && !needsRoleExtraction
     && !clearlyStale
+    && batch.track === 'primary_autumn'
     && ['career_like', 'unknown_web'].includes(link.kind);
 
   let decision = 'exclude';
   if (verificationReady) decision = 'verify';
-  else if (eligibleByScore || strongExtractionCandidate) decision = 'review';
-  if (!targetRoleFound || exclusions.length > 0) decision = 'exclude';
+  else if ((eligibleByScore || strongExtractionCandidate || priorityEmployerReviewCandidate) && batch.track !== 'summer_internship') decision = 'review';
+  if ((!targetRoleFound && !priorityEmployerReviewCandidate) || exclusions.length > 0) decision = 'exclude';
 
   const evidence = {
     role_families: roleFamilies.map(({ id, label, matches }) => ({ id, label, matches })),
@@ -454,6 +503,7 @@ export function screenCandidate(record, policy, asOfValue) {
     primary_strong_role_matches: primaryStrongRoleMatches,
     financial_context_matches: financialContextMatches,
     soe_matches: soeMatches,
+    priority_employer_matches: priorityEmployerMatches,
     preferred_locations: location.matches,
     preferred_city: location.preferred_city,
     preferred_location_bonus: location.score,
@@ -526,7 +576,9 @@ export function screenCandidatePool({ pool, policy, reviewState = emptyReviewSta
   validatePolicy(policy);
   if (!pool || !Array.isArray(pool.records)) throw new Error('Candidate pool must contain a records array');
   if (!safeDate(asOf)) throw new Error('--as-of must use a real YYYY-MM-DD date');
-  const reviewStateIndex = indexReviewState(reviewState);
+  const reviewStateIndex = isReviewStateCurrent(reviewState, asOf)
+    ? indexReviewState(reviewState)
+    : indexReviewState(emptyReviewState());
   const verificationLimit = Number.isInteger(limit) && limit >= 0 ? limit : (policy.verification_limit ?? 30);
   const resolvedReviewLimit = Number.isInteger(reviewLimit) && reviewLimit >= 0 ? reviewLimit : (policy.review_limit ?? 12);
   const records = pool.records
@@ -544,7 +596,7 @@ export function screenCandidatePool({ pool, policy, reviewState = emptyReviewSta
     schema_version: 1,
     generated_at: new Date().toISOString(),
     as_of: asOf,
-    scope: '本地粗筛结果；已处理记录由 candidate-review-state.json 遮罩，不会回到待核验队列。未处理记录尚未核验官方页面、未进行 A-G 正式评分，未写入 Pipeline、Tracker 或申请材料。',
+    scope: '本地粗筛结果；仅本轮（review-state 的 run_as_of 与本次 as_of 相同）已处理记录会遮罩候选。旧轮次审计记录保留但不会阻止更新后的源表重新进入筛选。未处理记录尚未核验官方页面、未进行 A-G 正式评分，未写入 Pipeline、Tracker 或申请材料。',
     input: {
       candidate_pool_generated_at: pool.generated_at ?? pool.generatedAt ?? null,
       candidate_count: pool.records.length,
@@ -556,6 +608,9 @@ export function screenCandidatePool({ pool, policy, reviewState = emptyReviewSta
       verification_limit: verificationLimit,
       review_limit: resolvedReviewLimit,
       preferred_locations: policy.preferred_locations ?? [],
+      location_strategy: policy.location_strategy ?? null,
+      review_state_applied: isReviewStateCurrent(reviewState, asOf),
+      review_state_run_as_of: reviewStateRunAsOf(reviewState) || null,
     },
     stats: {
       total_records: records.length,

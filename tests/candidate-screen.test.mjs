@@ -23,6 +23,7 @@ const policy = {
     source_label_is_confirmation: false,
     required_official_evidence: ['招聘批次名称', '候选人届别兼容性', '岗位当前开放状态'],
   },
+  priority_employer_patterns: ['中国东方资产'],
   role_families: [
     { id: 'credit_risk', label: '信用风险', score: 36, patterns: ['信用风险', '授信', '信评', '风险管理', '风控'] },
     { id: 'finance', label: '金融财务', score: 34, patterns: ['财务管理', '预算管理', '资金管理'] },
@@ -49,6 +50,7 @@ const policy = {
     mixed_low_fit_penalty: 18,
     stale_update_penalty: { '31-60': 12, '61+': 20 },
     manual_channel_penalty: 7,
+    priority_employer_bonus: 28,
   },
 };
 
@@ -88,10 +90,33 @@ const conflictingBatch = screenCandidate(candidate({
   batch: '暑期实习',
   sources: [{ batch: '提前批' }],
 }), policy, '2026-07-24');
-expect('conflicting source batch labels stay ambiguous and receive no autumn/early-batch bonus', conflictingBatch.evidence.batch.track === 'ambiguous_source_claim' && conflictingBatch.evidence.batch.source_claim === null && !conflictingBatch.positive_reasons.some((item) => item.includes('源表标注：提前批')));
+expect('summer and autumn labels stay ambiguous and receive no autumn/early-batch bonus', conflictingBatch.evidence.batch.track === 'ambiguous_source_claim' && conflictingBatch.evidence.batch.source_claim === null && !conflictingBatch.positive_reasons.some((item) => item.includes('源表标注：提前批')));
+
+const combinedAutumnBatch = screenCandidate(candidate({ batch: '27届秋招/提前批' }), policy, '2026-07-24');
+expect('autumn and early-batch labels form one formal-recruiting track', combinedAutumnBatch.evidence.batch.track === 'primary_autumn' && combinedAutumnBatch.evidence.batch.source_claim === '秋招/提前批' && combinedAutumnBatch.verification_ready);
 
 const broadMixed = screenCandidate(candidate({ title: '风险管理、财务管理、销售岗' }), policy, '2026-07-24');
 expect('mixed multi-role listing is never verification-ready', broadMixed.decision === 'review' && !broadMixed.verification_ready && broadMixed.needs_role_extraction);
+
+const fullWidthPipeAggregate = screenCandidate(candidate({
+  company: '示例金融科技公司',
+  title: '技术｜产品｜运营｜数据｜风险管理',
+  batch: '2027届秋招',
+}), policy, '2026-07-24');
+expect('full-width-pipe recruitment categories are never treated as one role', fullWidthPipeAggregate.decision === 'review' && !fullWidthPipeAggregate.verification_ready && fullWidthPipeAggregate.needs_role_extraction);
+
+const serviceLineAggregate = screenCandidate(candidate({
+  company: '示例专业服务机构',
+  title: '审计及鉴证服务 税务服务 咨询服务 交易服务',
+  batch: '2027届秋招',
+}), policy, '2026-07-24');
+expect('space-separated service lines are never treated as one role', !serviceLineAggregate.verification_ready && serviceLineAggregate.needs_role_extraction);
+
+const recruitmentProjectAggregate = screenCandidate(candidate({
+  title: '2026-2027秋季应届毕业生招聘及寒假实习生招聘，网申启动',
+  batch: '2027届秋招/提前批',
+}), policy, '2026-07-24');
+expect('recruitment-project announcement is never treated as one role', !recruitmentProjectAggregate.verification_ready && recruitmentProjectAggregate.needs_role_extraction);
 
 const strongButNoisy = screenCandidate(candidate({
   title: '信评岗、销售岗、算法工程师',
@@ -104,6 +129,19 @@ expect('sales-only listing is excluded despite a preferred city', salesOnly.deci
 
 const stale = screenCandidate(candidate({ updated_at: '2026-04-01' }), policy, '2026-07-24');
 expect('very stale source record is sent to review rather than automatic verification', stale.decision === 'review' && !stale.verification_ready && stale.evidence.update_age_days >= 61);
+
+const campusOnly = screenCandidate(candidate({ batch: '2027届校园招聘' }), policy, '2026-07-24');
+expect('campus-only source label never bypasses the autumn/early-batch gate', campusOnly.decision === 'review' && !campusOnly.verification_ready && campusOnly.evidence.batch.track === 'campus');
+
+const priorityEmployer = screenCandidate(candidate({
+  company: '中国东方资产管理股份有限公司',
+  employer_type: '央国企',
+  industry: '金融/资产管理/不良资产处置',
+  title: '总部管培生 分公司业务岗',
+  batch: '2027届秋招',
+  location: '全国',
+}), policy, '2026-07-24');
+expect('priority financial SOE aggregate is retained only for role extraction', priorityEmployer.decision === 'review' && priorityEmployer.needs_role_extraction && priorityEmployer.evidence.priority_employer_matches.includes('中国东方资产'));
 
 const result = screenCandidatePool({
   pool: {
@@ -130,6 +168,7 @@ const resolved = screenCandidatePool({
   policy,
   reviewState: {
     schema_version: 1,
+    run_as_of: '2026-07-24',
     entries: [{
       candidate_id: highFit.candidate_id,
       status: 'entered_pipeline',
@@ -141,3 +180,19 @@ const resolved = screenCandidatePool({
 });
 expect('processed candidates are removed from fresh verification and review queues', resolved.shortlist.length === 0 && resolved.review_queue.length === 1 && resolved.stats.processed_total === 1);
 expect('processed candidates retain their original screen decision for audit', resolved.processed[0].screening.source_decision === 'verify' && resolved.processed[0].screening.review_state.status === 'entered_pipeline');
+
+const rerun = screenCandidatePool({
+  pool: {
+    generated_at: '2026-08-13T00:00:00Z',
+    source_count: 1,
+    records: [candidate()],
+  },
+  policy,
+  reviewState: {
+    schema_version: 1,
+    run_as_of: '2026-07-24',
+    entries: [{ candidate_id: highFit.candidate_id, status: 'entered_pipeline', checked: '2026-07-24', pipeline: true }],
+  },
+  asOf: '2026-08-13',
+});
+expect('old review state does not mask a new screening round', rerun.shortlist.length === 1 && rerun.stats.processed_total === 0 && rerun.policy.review_state_applied === false);
